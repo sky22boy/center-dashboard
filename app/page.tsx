@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   collection,
   addDoc,
@@ -19,23 +19,24 @@ type Child = {
   name: string;
   sessionsTotal: number;
   sessionsUsed: number;
-  createdAt?: any;
 };
 
-const toNum = (v: any) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-};
+const COL = "children";
 
-const remaining = (c: Child) => Math.max(0, toNum(c.sessionsTotal) - toNum(c.sessionsUsed));
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
 
-const statusVariant = (rem: number) => {
-  if (rem === 0) return "danger"; // انتهت
-  if (rem === 1) return "warning"; // قبل الأخيرة
-  return "success";
-};
+function toneByRemaining(remaining: number) {
+  // قبل الأخيرة = أصفر (المتبقي 1)
+  if (remaining === 1) return "warn";
+  // الأخيرة/خلص = أحمر (المتبقي 0 أو أقل)
+  if (remaining <= 0) return "danger";
+  // غير ذلك = أخضر
+  return "ok";
+}
 
-export default function Home() {
+export default function Page() {
   const [children, setChildren] = useState<Child[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -43,11 +44,13 @@ export default function Home() {
   const [newName, setNewName] = useState("");
   const [newTotal, setNewTotal] = useState<number>(12);
 
-  // بحث
+  // بحث + تحديد
   const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState<string>("");
 
   useEffect(() => {
-    const q = query(collection(db, "children"), orderBy("createdAt", "desc"));
+    const q = query(collection(db, COL), orderBy("name", "asc"));
+
     const unsub = onSnapshot(
       q,
       (snap) => {
@@ -55,19 +58,27 @@ export default function Home() {
           const data = d.data() as any;
           return {
             id: d.id,
-            name: data.name ?? "",
-            sessionsTotal: toNum(data.sessionsTotal),
-            sessionsUsed: toNum(data.sessionsUsed),
-            createdAt: data.createdAt,
+            name: String(data.name ?? ""),
+            sessionsTotal: Number(data.sessionsTotal ?? 12),
+            sessionsUsed: Number(data.sessionsUsed ?? 0),
           };
         });
+
         setChildren(list);
         setLoading(false);
+
+        if (selectedId && !list.some((c) => c.id === selectedId)) {
+          setSelectedId("");
+        }
       },
-      () => setLoading(false)
+      (err) => {
+        console.error("Firestore snapshot error:", err);
+        setLoading(false);
+      }
     );
 
     return () => unsub();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const filtered = useMemo(() => {
@@ -76,162 +87,149 @@ export default function Home() {
     return children.filter((c) => c.name.toLowerCase().includes(s));
   }, [children, search]);
 
-  const addChild = async () => {
+  const selected = useMemo(
+    () => children.find((c) => c.id === selectedId) || null,
+    [children, selectedId]
+  );
+
+  async function addChild() {
     const name = newName.trim();
-    const total = toNum(newTotal) > 0 ? toNum(newTotal) : 12;
     if (!name) return;
 
-    await addDoc(collection(db, "children"), {
+    const total = clamp(Number(newTotal || 12), 1, 999);
+
+    await addDoc(collection(db, COL), {
       name,
       sessionsTotal: total,
       sessionsUsed: 0,
       createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
     });
 
     setNewName("");
     setNewTotal(12);
-  };
+    setSearch("");
+  }
 
-  // ✅ كل العمليات صارت “حسب الطفل نفسه” (مو عشوائي)
-  const incSession = async (child: Child) => {
-    const used = toNum(child.sessionsUsed);
-    const total = toNum(child.sessionsTotal);
-    if (used >= total) return;
+  async function removeChild(id: string) {
+    await deleteDoc(doc(db, COL, id));
+  }
 
-    await updateDoc(doc(db, "children", child.id), { sessionsUsed: used + 1 });
-  };
+  async function incSession(id: string, current: Child) {
+    const used = clamp(current.sessionsUsed + 1, 0, current.sessionsTotal);
+    await updateDoc(doc(db, COL, id), {
+      sessionsUsed: used,
+      updatedAt: serverTimestamp(),
+    });
+  }
 
-  const decSession = async (child: Child) => {
-    const used = toNum(child.sessionsUsed);
-    if (used <= 0) return;
+  async function decSession(id: string, current: Child) {
+    const used = clamp(current.sessionsUsed - 1, 0, current.sessionsTotal);
+    await updateDoc(doc(db, COL, id), {
+      sessionsUsed: used,
+      updatedAt: serverTimestamp(),
+    });
+  }
 
-    await updateDoc(doc(db, "children", child.id), { sessionsUsed: used - 1 });
-  };
-
-  const renew = async (child: Child) => {
-    // التجديد: يصير 0 / total
-    await updateDoc(doc(db, "children", child.id), { sessionsUsed: 0 });
-  };
-
-  const removeChild = async (child: Child) => {
-    const ok = confirm(`هل تريد حذف الطفل: ${child.name} ؟`);
-    if (!ok) return;
-
-    await deleteDoc(doc(db, "children", child.id));
-  };
+  async function renew(id: string) {
+    // التجديد: يصير 0 من total
+    await updateDoc(doc(db, COL, id), {
+      sessionsUsed: 0,
+      updatedAt: serverTimestamp(),
+    });
+  }
 
   return (
-    <div className="page">
-      <header className="header">
-        <div className="brand">
-          <div className="dot" />
-          <div>
-            <div className="brandTitle">لوحة التحكم</div>
-            <div className="brandSub">إدارة الأطفال والجلسات (Firestore)</div>
-          </div>
-        </div>
-
-        <div className="headerRight">
-          <div className="pill success">Firestore: متصل</div>
-          <div className="pill neutral">عدد الأطفال: {children.length}</div>
-        </div>
+    <main className="wrap">
+      <header className="topbar">
+        <h1 className="title">لوحة التحكّم</h1>
+        <div className="badge">Firestore</div>
       </header>
 
-      <div className="layout">
-        {/* يمين: إضافة طفل */}
-        <section className="panel">
-          <div className="panelTitle">إضافة طفل</div>
-
-          <label className="label">اسم الطفل</label>
-          <input
-            className="input"
-            placeholder="مثال: محمد"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-          />
-
-          <label className="label">عدد الجلسات عند الإضافة</label>
-          <input
-            className="input"
-            type="number"
-            value={newTotal}
-            onChange={(e) => setNewTotal(Number(e.target.value))}
-          />
-
-          <button className="btn primary full" onClick={addChild}>
-            إضافة
-          </button>
-
-          <div className="hint">
-            يتم كل شيء من داخل الموقع: إضافة، بحث، زيادة/نقص، تجديد، حذف.
-          </div>
-        </section>
-
-        {/* يسار: بحث + قائمة الأطفال */}
-        <section className="panel wide">
-          <div className="panelTop">
-            <div className="panelTitle">بحث وإدارة</div>
-
-            <div className="searchRow">
-              <input
-                className="input"
-                placeholder="ابحث باسم الطفل..."
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-              />
-              <button className="btn ghost" onClick={() => setSearch("")}>
-                مسح
-              </button>
-            </div>
+      <section className="grid">
+        {/* يسار: البحث + القائمة */}
+        <div className="panel">
+          <div className="panelHead">
+            <h2>بحث وإدارة</h2>
+            <input
+              className="input"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="ابحث باسم الطفل..."
+            />
           </div>
 
           <div className="tableHead">
-            <div>الاسم</div>
-            <div className="center">الجلسات</div>
-            <div className="center">المتبقي</div>
-            <div className="actionsCol">إجراءات</div>
+            <span>الاسم</span>
+            <span>الجلسات</span>
+            <span>المتبقي</span>
           </div>
 
           <div className="list">
             {loading ? (
-              <div className="empty">جاري التحميل...</div>
+              <div className="empty">جارٍ التحميل...</div>
             ) : filtered.length === 0 ? (
-              <div className="empty">لا توجد نتائج.</div>
+              <div className="empty">لا توجد نتائج</div>
             ) : (
               filtered.map((c) => {
-                const used = toNum(c.sessionsUsed);
-                const total = toNum(c.sessionsTotal);
-                const rem = remaining(c);
-                const v = statusVariant(rem);
+                const remaining = c.sessionsTotal - c.sessionsUsed;
+                const tone = toneByRemaining(remaining);
+                const active = c.id === selectedId;
 
                 return (
-                  <div key={c.id} className="rowCard">
-                    <div className="nameCell">{c.name}</div>
-
-                    <div className="center mono">
-                      {used} / {total}
+                  <div
+                    key={c.id}
+                    className={`row ${tone} ${active ? "active" : ""}`}
+                    onClick={() => setSelectedId(c.id)}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <div className="name">{c.name}</div>
+                    <div className="cell">
+                      {c.sessionsUsed}/{c.sessionsTotal}
                     </div>
+                    <div className="cell">{remaining}</div>
 
-                    <div className="center">
-                      <span className={`pill ${v}`}>
-                        {rem === 0 ? "انتهت" : rem === 1 ? "قبل الأخيرة" : `متبقي: ${rem}`}
-                      </span>
-                    </div>
-
-                    <div className="actionsCol">
-                      <button className="btn small" onClick={() => decSession(c)} disabled={used <= 0}>
+                    {/* الأزرار بجانب اسم الطفل */}
+                    <div className="actions">
+                      <button
+                        className="btn ghost"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          decSession(c.id, c);
+                        }}
+                        type="button"
+                      >
                         - جلسة
                       </button>
-
-                      <button className="btn small primary" onClick={() => incSession(c)} disabled={used >= total}>
+                      <button
+                        className="btn success"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          incSession(c.id, c);
+                        }}
+                        type="button"
+                      >
                         + جلسة
                       </button>
-
-                      <button className="btn small warning" onClick={() => renew(c)}>
+                      <button
+                        className="btn warn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          renew(c.id);
+                        }}
+                        type="button"
+                      >
                         تجديد
                       </button>
-
-                      <button className="btn small danger" onClick={() => removeChild(c)}>
+                      <button
+                        className="btn danger"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeChild(c.id);
+                        }}
+                        type="button"
+                      >
                         حذف
                       </button>
                     </div>
@@ -240,9 +238,49 @@ export default function Home() {
               })
             )}
           </div>
-        </section>
-      </div>
-    </div>
+        </div>
+
+        {/* يمين: إضافة طفل */}
+        <div className="panel">
+          <div className="panelHead">
+            <h2>إضافة طفل</h2>
+          </div>
+
+          <label className="field">
+            <span>اسم الطفل</span>
+            <input
+              className="input"
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="مثال: محمد"
+            />
+          </label>
+
+          <label className="field">
+            <span>عدد الجلسات (عند الإضافة)</span>
+            <input
+              className="input"
+              type="number"
+              value={newTotal}
+              onChange={(e) => setNewTotal(Number(e.target.value))}
+              min={1}
+            />
+          </label>
+
+          <button className="btn primary full" onClick={addChild} type="button">
+            إضافة
+          </button>
+
+          {selected ? (
+            <div className="selectedBox">
+              <span className="selectedLabel">المحدّد:</span>
+              <span className="selectedValue">{selected.name}</span>
+            </div>
+          ) : (
+            <div className="selectedBox mutedBox">اختر طفلًا من القائمة لإدارته</div>
+          )}
+        </div>
+      </section>
+    </main>
   );
 }
-
