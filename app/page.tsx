@@ -11,14 +11,27 @@ import {
   query,
   updateDoc,
   serverTimestamp,
+  getDocs,
+  Timestamp,
 } from "firebase/firestore";
 import { db } from "./lib/firebase";
 
 type Child = {
   id: string;
   name: string;
-  sessionsTotal: number;
-  sessionsUsed: number;
+  sessionsTotal: number; // مثل 12
+  sessionsUsed: number;  // من 0 إلى 12
+
+  // ✅ تجديد مُعلّق (يعني دفع قبل ما يكمل 12)
+  renewalPending?: boolean;
+  renewalPendingAmount?: number;
+  renewalPendingAt?: any; // Timestamp
+};
+
+type RenewalLog = {
+  id: string;
+  amount: number;
+  createdAt?: Timestamp;
 };
 
 const COL = "children";
@@ -27,13 +40,24 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
 
-function toneByRemaining(remaining: number) {
-  // قبل الأخيرة = أصفر (المتبقي 1)
+type Tone = "ok" | "warn" | "danger";
+function toneByRemaining(remaining: number): Tone {
   if (remaining === 1) return "warn";
-  // الأخيرة/خلص = أحمر (المتبقي 0 أو أقل)
   if (remaining <= 0) return "danger";
-  // غير ذلك = أخضر
   return "ok";
+}
+
+function fmtDateTime(ts?: Timestamp) {
+  if (!ts) return "—";
+  const d = ts.toDate();
+  // تاريخ + وقت بشكل مفهوم
+  return d.toLocaleString("ar-IQ", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 export default function Page() {
@@ -48,6 +72,17 @@ export default function Page() {
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string>("");
 
+  // ✅ مودال سجل التجديد
+  const [logOpen, setLogOpen] = useState(false);
+  const [logChild, setLogChild] = useState<Child | null>(null);
+  const [logLoading, setLogLoading] = useState(false);
+  const [renewals, setRenewals] = useState<RenewalLog[]>([]);
+
+  // ✅ مودال التجديد (إدخال مبلغ)
+  const [renewOpen, setRenewOpen] = useState(false);
+  const [renewChild, setRenewChild] = useState<Child | null>(null);
+  const [renewAmount, setRenewAmount] = useState<string>("");
+
   useEffect(() => {
     const q = query(collection(db, COL), orderBy("name", "asc"));
 
@@ -61,6 +96,13 @@ export default function Page() {
             name: String(data.name ?? ""),
             sessionsTotal: Number(data.sessionsTotal ?? 12),
             sessionsUsed: Number(data.sessionsUsed ?? 0),
+
+            renewalPending: Boolean(data.renewalPending ?? false),
+            renewalPendingAmount:
+              data.renewalPendingAmount !== undefined
+                ? Number(data.renewalPendingAmount)
+                : undefined,
+            renewalPendingAt: data.renewalPendingAt,
           };
         });
 
@@ -102,6 +144,7 @@ export default function Page() {
       name,
       sessionsTotal: total,
       sessionsUsed: 0,
+      renewalPending: false,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -115,10 +158,36 @@ export default function Page() {
     await deleteDoc(doc(db, COL, id));
   }
 
+  // ✅ زيادة جلسة مع منطق "التجديد المعلّق"
   async function incSession(id: string, current: Child) {
-    const used = clamp(current.sessionsUsed + 1, 0, current.sessionsTotal);
+    const total = current.sessionsTotal;
+    const nextUsed = clamp(current.sessionsUsed + 1, 0, total);
+
+    // إذا وصل 12:
+    if (nextUsed >= total) {
+      // إذا كان هناك تجديد مُعلّق => صفّر مباشرة وابدأ دورة جديدة
+      if (current.renewalPending) {
+        await updateDoc(doc(db, COL, id), {
+          sessionsUsed: 0,
+          renewalPending: false,
+          renewalPendingAmount: null,
+          renewalPendingAt: null,
+          updatedAt: serverTimestamp(),
+        });
+        return;
+      }
+
+      // إذا لا يوجد تجديد => يبقى على 12 (لا يرجع للصفر)
+      await updateDoc(doc(db, COL, id), {
+        sessionsUsed: total,
+        updatedAt: serverTimestamp(),
+      });
+      return;
+    }
+
+    // قبل 12: تحديث طبيعي
     await updateDoc(doc(db, COL, id), {
-      sessionsUsed: used,
+      sessionsUsed: nextUsed,
       updatedAt: serverTimestamp(),
     });
   }
@@ -131,12 +200,72 @@ export default function Page() {
     });
   }
 
-  async function renew(id: string) {
-    // التجديد: يصير 0 من total
-    await updateDoc(doc(db, COL, id), {
-      sessionsUsed: 0,
+  // ✅ فتح مودال التجديد لإدخال مبلغ
+  function openRenewModal(child: Child) {
+    setRenewChild(child);
+    setRenewAmount("");
+    setRenewOpen(true);
+  }
+
+  // ✅ تنفيذ التجديد: يسجّل تاريخ/وقت/مبلغ + يجعل التجديد "معلّق"
+  async function confirmRenew() {
+    if (!renewChild) return;
+
+    const amountNum = Number(String(renewAmount).replace(/[^\d.]/g, ""));
+    if (!Number.isFinite(amountNum) || amountNum <= 0) {
+      alert("رجاءً أدخل مبلغًا صحيحًا.");
+      return;
+    }
+
+    const childId = renewChild.id;
+
+    // 1) أضف سجل داخل subcollection
+    await addDoc(collection(db, COL, childId, "renewals"), {
+      amount: amountNum,
+      createdAt: serverTimestamp(),
+    });
+
+    // 2) علّم الطفل أن لديه تجديد مُعلّق (لا نصفر الآن)
+    await updateDoc(doc(db, COL, childId), {
+      renewalPending: true,
+      renewalPendingAmount: amountNum,
+      renewalPendingAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
+
+    setRenewOpen(false);
+    setRenewChild(null);
+    setRenewAmount("");
+  }
+
+  // ✅ فتح سجل التجديدات
+  async function openRenewalsLog(child: Child) {
+    setLogChild(child);
+    setLogOpen(true);
+    setLogLoading(true);
+    setRenewals([]);
+
+    try {
+      const q = query(
+        collection(db, COL, child.id, "renewals"),
+        orderBy("createdAt", "desc")
+      );
+      const snap = await getDocs(q);
+      const rows: RenewalLog[] = snap.docs.map((d) => {
+        const data = d.data() as any;
+        return {
+          id: d.id,
+          amount: Number(data.amount ?? 0),
+          createdAt: data.createdAt,
+        };
+      });
+      setRenewals(rows);
+    } catch (e) {
+      console.error(e);
+      setRenewals([]);
+    } finally {
+      setLogLoading(false);
+    }
   }
 
   return (
@@ -180,17 +309,28 @@ export default function Page() {
                   <div
                     key={c.id}
                     className={`row ${tone} ${active ? "active" : ""}`}
+
                     onClick={() => setSelectedId(c.id)}
                     role="button"
                     tabIndex={0}
                   >
-                    <div className="name">{c.name}</div>
+                    <div className="namePill">
+                      <span className="nameText">{c.name}</span>
+
+                      {/* مؤشر بسيط إذا يوجد تجديد معلّق */}
+                      {c.renewalPending ? (
+                        <span className="pendingTag" title="تم التجديد مسبقًا وسيُصفّر العداد عند إكمال الجلسات">
+                          مجدَّد ✓
+                        </span>
+                      ) : null}
+                    </div>
+
                     <div className="cell">
                       {c.sessionsUsed}/{c.sessionsTotal}
                     </div>
+
                     <div className="cell">{remaining}</div>
 
-                    {/* الأزرار بجانب اسم الطفل */}
                     <div className="actions">
                       <button
                         className="btn ghost"
@@ -202,6 +342,7 @@ export default function Page() {
                       >
                         - جلسة
                       </button>
+
                       <button
                         className="btn success"
                         onClick={(e) => {
@@ -212,16 +353,31 @@ export default function Page() {
                       >
                         + جلسة
                       </button>
+
+                      {/* ✅ زر تجديد الآن يفتح إدخال مبلغ */}
                       <button
                         className="btn warn"
                         onClick={(e) => {
                           e.stopPropagation();
-                          renew(c.id);
+                          openRenewModal(c);
                         }}
                         type="button"
                       >
                         تجديد
                       </button>
+
+                      {/* ✅ زر سجل التجديد */}
+                      <button
+                        className="btn primary"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openRenewalsLog(c);
+                        }}
+                        type="button"
+                      >
+                        سجل التجديد
+                      </button>
+
                       <button
                         className="btn danger"
                         onClick={(e) => {
@@ -281,6 +437,99 @@ export default function Page() {
           )}
         </div>
       </section>
+
+      {/* ✅ نافذة إدخال مبلغ التجديد */}
+      {renewOpen && renewChild ? (
+        <div className="modalOverlay" onClick={() => setRenewOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modalTitle">تجديد اشتراك</div>
+            <div className="modalSub">
+              الطفل: <strong>{renewChild.name}</strong>
+            </div>
+
+            <label className="field" style={{ marginTop: 10 }}>
+              <span>المبلغ المدفوع</span>
+              <input
+                className="input"
+                value={renewAmount}
+                onChange={(e) => setRenewAmount(e.target.value)}
+                placeholder="مثال: 25000"
+                inputMode="numeric"
+              />
+            </label>
+
+            <div className="modalActions">
+              <button className="btn ghost" onClick={() => setRenewOpen(false)} type="button">
+                إلغاء
+              </button>
+              <button className="btn warn" onClick={confirmRenew} type="button">
+                حفظ التجديد
+              </button>
+            </div>
+
+            <div className="modalHint">
+              ملاحظة: إذا تم التجديد قبل إكمال {renewChild.sessionsTotal} جلسة، فلن يُصفّر العداد الآن، بل يُصفّر تلقائيًا عند إكمال الجلسات.
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* ✅ نافذة سجل التجديد */}
+      {logOpen && logChild ? (
+        <div className="modalOverlay" onClick={() => setLogOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modalTitle">سجل التجديد</div>
+            <div className="modalSub">
+              الطفل: <strong>{logChild.name}</strong>
+            </div>
+
+            {/* حالة التجديد المعلّق */}
+            <div className="logMeta">
+              <span>
+                الحالة:{" "}
+                {logChild.renewalPending ? (
+                  <strong style={{ color: "#fbbf24" }}>تجديد مُعلّق</strong>
+                ) : (
+                  <strong style={{ color: "#9ca3af" }}>لا يوجد تجديد مُعلّق</strong>
+                )}
+              </span>
+              {logChild.renewalPending ? (
+                <span>
+                  آخر مبلغ: <strong>{logChild.renewalPendingAmount ?? "—"}</strong> —{" "}
+                  {fmtDateTime(logChild.renewalPendingAt)}
+                </span>
+              ) : null}
+            </div>
+
+            <div className="logBox">
+              {logLoading ? (
+                <div className="empty">جارٍ التحميل...</div>
+              ) : renewals.length === 0 ? (
+                <div className="empty">لا يوجد تجديدات مسجّلة.</div>
+              ) : (
+                <div className="logTable">
+                  <div className="logHead">
+                    <span>التاريخ والوقت</span>
+                    <span>المبلغ</span>
+                  </div>
+                  {renewals.map((r) => (
+                    <div className="logRow" key={r.id}>
+                      <span>{fmtDateTime(r.createdAt)}</span>
+                      <span>{r.amount}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="modalActions">
+              <button className="btn primary" onClick={() => setLogOpen(false)} type="button">
+                إغلاق
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
